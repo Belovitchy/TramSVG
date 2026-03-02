@@ -28,6 +28,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const downloadPNGButton = document.getElementById("downloadPNGButton");
   const downloadJPEGButton = document.getElementById("downloadJPEGButton");
   const downloadSVGButton = document.getElementById("downloadSVGButton");
+  const downloadPDFButton = document.getElementById("downloadPDFButton");
   const sourceCanvas = document.getElementById("sourceCanvas");
   const resultCanvas = document.getElementById("resultCanvas");
   const pixelSizeInput = document.getElementById("pixelSize");
@@ -49,6 +50,7 @@ document.addEventListener("DOMContentLoaded", () => {
   // --- CONFIGURATION ---
   const SVG_FILES = Object.keys(SVG_DATA);
   let paletteSettings = []; // [{ svgFile: '...', color: '#...', size: 1.0 }, ...]
+  let gridBrushIndices = []; // Stocke l'index du pinceau pour chaque 'pixel' de la grille
 
   // --- GESTIONNAIRES D'ÉVÉNEMENTS ---
   imageLoader.addEventListener("change", (e) => {
@@ -72,6 +74,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         // 3. Lancer le premier calcul de la version dégradée et de la palette
         updateDegradedSourceAndPalette();
+        processImage(true); // Lancer le rendu initial automatiquement
       };
       img.src = event.target.result;
     };
@@ -81,6 +84,7 @@ document.addEventListener("DOMContentLoaded", () => {
   pixelSizeInput.addEventListener("change", () => {
     if (img.src) {
       updateDegradedSourceAndPalette();
+      processImage(false); // Relancer un rendu complet car la grille a changé, mais ne pas redessiner de suite.
     }
   });
 
@@ -89,7 +93,13 @@ document.addEventListener("DOMContentLoaded", () => {
       alert("Veuillez d'abord charger une image.");
       return;
     }
-    processImage();
+    if (gridBrushIndices.length === 0) {
+      alert(
+        "Veuillez d'abord charger une image ou modifier la taille de la trame pour générer la distribution initiale.",
+      );
+      return;
+    }
+    redrawResult(); // Lancer un redessin rapide avec la distribution existante
   });
 
   downloadPNGButton.addEventListener("click", () => {
@@ -116,11 +126,27 @@ document.addEventListener("DOMContentLoaded", () => {
     generateAndDownloadSVG();
   });
 
+  downloadPDFButton.addEventListener("click", () => {
+    if (!img.src) {
+      alert("Veuillez d'abord générer une image.");
+      return;
+    }
+    generateAndDownloadPDF();
+  });
+
   // Gestion de l'aperçu de la couleur de fond
   const bgPickerWrapper = backgroundColorInput.parentElement;
   bgPickerWrapper.style.backgroundColor = backgroundColorInput.value;
   backgroundColorInput.addEventListener("input", (e) => {
     bgPickerWrapper.style.backgroundColor = e.target.value;
+    const datalist = document.getElementById("dominant-colors");
+    if (datalist) {
+      const firstOption = datalist.querySelector("option");
+      // The datalist is structured with the background color as the first option.
+      if (firstOption) {
+        firstOption.value = e.target.value;
+      }
+    }
   });
 
   // --- LOGIQUE PRINCIPALE ---
@@ -153,10 +179,13 @@ document.addEventListener("DOMContentLoaded", () => {
     document.body.style.cursor = "wait";
     try {
       const pixelSize = parseInt(pixelSizeInput.value, 10);
-      if (pixelSize <= 0) return;
+      if (pixelSize <= 0) {
+        console.error("Invalid pixelSize (<= 0).");
+        return;
+      }
 
       console.log(
-        `Dégradation de la source pour une trame de ${pixelSize}px...`
+        `Dégradation de la source pour une trame de ${pixelSize}px...`,
       );
 
       const sourceWidth = sourceCanvas.width;
@@ -173,7 +202,7 @@ document.addEventListener("DOMContentLoaded", () => {
             x * pixelSize,
             y * pixelSize,
             pixelSize,
-            pixelSize
+            pixelSize,
           );
           degradedSourceCtx.fillStyle = `rgba(${avgColor.r}, ${avgColor.g}, ${
             avgColor.b
@@ -182,7 +211,7 @@ document.addEventListener("DOMContentLoaded", () => {
         }
       }
       console.log(
-        `Source dégradée créée (${degradedWidth}x${degradedHeight} pixels).`
+        `Source dégradée créée (${degradedWidth}x${degradedHeight} pixels).`,
       );
 
       setupPaletteControls();
@@ -194,22 +223,16 @@ document.addEventListener("DOMContentLoaded", () => {
   /**
    * Génère l'image finale en utilisant la source dégradée et la palette configurée.
    */
-  async function processImage() {
+  async function processImage(shouldRedrawImmediately = true) {
     if (degradedSourceCanvas.width === 0) {
       alert(
-        "La source dégradée n'a pas été calculée. Changez la taille de la trame."
+        "La source dégradée n'a pas été calculée. Changez la taille de la trame.",
       );
       return;
     }
 
     document.body.style.cursor = "wait";
     try {
-      const pixelSize = parseInt(pixelSizeInput.value, 10);
-      const backgroundColor = backgroundColorInput.value;
-
-      resultCtx.fillStyle = backgroundColor;
-      resultCtx.fillRect(0, 0, resultCanvas.width, resultCanvas.height);
-
       const paletteRgbColors = paletteSettings.map((p) => ({
         ...p,
         rgb: hexToRgb(p.color),
@@ -220,9 +243,10 @@ document.addEventListener("DOMContentLoaded", () => {
         0,
         0,
         degradedSourceCanvas.width,
-        degradedSourceCanvas.height
+        degradedSourceCanvas.height,
       ).data;
-      const drawPromises = [];
+
+      gridBrushIndices = []; // Réinitialiser le mappage
 
       for (let i = 0; i < degradedData.length; i += 4) {
         const r = degradedData[i];
@@ -230,28 +254,61 @@ document.addEventListener("DOMContentLoaded", () => {
         const b = degradedData[i + 2];
         const a = degradedData[i + 3];
 
-        if (a === 0) continue;
+        if (a === 0) {
+          gridBrushIndices.push(-1); // -1 pour les pixels transparents
+          continue;
+        }
 
         const avgColor = { r, g, b };
-        const pixelIndex = i / 4;
-        const x = (pixelIndex % degradedSourceCanvas.width) * pixelSize;
-        const y =
-          Math.floor(pixelIndex / degradedSourceCanvas.width) * pixelSize;
 
-        let closestPaletteEntry = paletteRgbColors[0];
+        let closestPaletteIndex = 0;
         let minDistance = Infinity;
 
-        paletteRgbColors.forEach((entry) => {
+        paletteRgbColors.forEach((entry, index) => {
           if (!entry.rgb) return;
           const dist = colorDistance(avgColor, entry.rgb);
           if (dist < minDistance) {
             minDistance = dist;
-            closestPaletteEntry = entry;
+            closestPaletteIndex = index;
           }
         });
+        gridBrushIndices.push(closestPaletteIndex);
+      }
 
-        const settings = closestPaletteEntry;
+      console.log("Mappage des couleurs terminé. Lancement du redessin.");
+      if (shouldRedrawImmediately) {
+        await redrawResult(); // Appel de la nouvelle fonction de dessin
+      }
+    } finally {
+      document.body.style.cursor = "default";
+    }
+  }
+
+  /**
+   * (Nouvelle fonction) Redessine le canevas de résultat en utilisant le mappage de pinceaux pré-calculé.
+   */
+  async function redrawResult() {
+    document.body.style.cursor = "wait";
+    try {
+      const pixelSize = parseInt(pixelSizeInput.value, 10);
+      const backgroundColor = backgroundColorInput.value;
+
+      resultCtx.fillStyle = backgroundColor;
+      resultCtx.fillRect(0, 0, resultCanvas.width, resultCanvas.height);
+
+      if (gridBrushIndices.length === 0) return;
+
+      const drawPromises = [];
+
+      for (let i = 0; i < gridBrushIndices.length; i++) {
+        const brushIndex = gridBrushIndices[i];
+        if (brushIndex === -1) continue; // Ignorer les pixels transparents
+
+        const settings = paletteSettings[brushIndex];
         if (settings && SVG_DATA[settings.svgFile]) {
+          const x = (i % degradedSourceCanvas.width) * pixelSize;
+          const y = Math.floor(i / degradedSourceCanvas.width) * pixelSize;
+
           drawPromises.push(
             drawSvg(
               resultCtx,
@@ -259,8 +316,8 @@ document.addEventListener("DOMContentLoaded", () => {
               x,
               y,
               pixelSize * settings.size,
-              settings.color
-            )
+              settings.color,
+            ),
           );
         }
       }
@@ -274,6 +331,23 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // --- FONCTIONS DE MISE EN PLACE DE L'UI ---
 
+  function getStyledSvg(svgText, color) {
+    const parser = new DOMParser();
+    const svgDoc = parser.parseFromString(svgText, "image/svg+xml");
+    const svgElement = svgDoc.documentElement;
+
+    // Find all shape elements and set their fill attribute
+    const shapes = svgElement.querySelectorAll(
+      "path, circle, rect, polygon, line, polyline",
+    );
+    shapes.forEach((shape) => {
+      shape.setAttribute("fill", color);
+    });
+
+    const serializer = new XMLSerializer();
+    return serializer.serializeToString(svgElement);
+  }
+
   function setupPaletteControls() {
     if (!controlsContainer) {
       console.error("Le conteneur #svgControls n'a pas été trouvé.");
@@ -284,7 +358,7 @@ document.addEventListener("DOMContentLoaded", () => {
       0,
       0,
       degradedSourceCanvas.width,
-      degradedSourceCanvas.height
+      degradedSourceCanvas.height,
     );
     const dominantColors = getDominantColors(imageData, 8);
 
@@ -312,7 +386,9 @@ document.addEventListener("DOMContentLoaded", () => {
         return `<option value="${file}" ${isSelected}>${displayName}</option>`;
       }).join("");
 
-      const defaultSvgContent = SVG_DATA[settings.svgFile] || "";
+      const defaultSvgContent = settings.svgFile
+        ? getStyledSvg(SVG_DATA[settings.svgFile], settings.color)
+        : "";
 
       controlEl.innerHTML = `
                 <div class="palette-control-header">
@@ -328,14 +404,14 @@ document.addEventListener("DOMContentLoaded", () => {
                  <div class="palette-row">
                     <label for="color-${index}">Couleur:</label>
                     <input type="color" id="color-${index}" class="color-input" value="${
-        settings.color
-      }" list="dominant-colors">
+                      settings.color
+                    }" list="dominant-colors">
                 </div>
                 <div class="palette-row">
                     <label for="size-${index}">Taille:</label>
                     <input type="range" id="size-${index}" class="size-slider" min="0.2" max="3.0" step="0.05" value="${
-        settings.size
-      }">
+                      settings.size
+                    }">
                 </div>
             `;
 
@@ -348,7 +424,10 @@ document.addEventListener("DOMContentLoaded", () => {
         const newSvgFile = e.target.value;
         paletteSettings[index].svgFile = newSvgFile;
         if (SVG_DATA[newSvgFile]) {
-          previewEl.innerHTML = SVG_DATA[newSvgFile];
+          previewEl.innerHTML = getStyledSvg(
+            SVG_DATA[newSvgFile],
+            paletteSettings[index].color,
+          );
         }
       });
 
@@ -365,9 +444,14 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const datalist = document.createElement("datalist");
     datalist.id = "dominant-colors";
-    datalist.innerHTML = dominantColors
+
+    const backgroundColor = backgroundColorInput.value;
+    let datalistHTML = `<option value="${backgroundColor}"></option>`;
+    datalistHTML += dominantColors
       .map((c) => `<option value="${c}"></option>`)
       .join("");
+    datalist.innerHTML = datalistHTML;
+
     controlsContainer.appendChild(datalist);
     controlsContainer.appendChild(listContainer);
   }
@@ -400,7 +484,7 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   function getDominantColors(imageData, colorCount) {
-    const MIN_COLOR_DISTANCE = 60;
+    const MIN_COLOR_DISTANCE = 30;
 
     const data = imageData.data;
     const colorMap = {};
@@ -418,7 +502,7 @@ document.addEventListener("DOMContentLoaded", () => {
       colorMap[key].count++;
     }
     const sortedColorGroups = Object.values(colorMap).sort(
-      (a, b) => b.count - a.count
+      (a, b) => b.count - a.count,
     );
 
     const finalPalette = [];
@@ -471,13 +555,13 @@ document.addEventListener("DOMContentLoaded", () => {
     return Math.sqrt(
       Math.pow(rgb1.r - rgb2.r, 2) +
         Math.pow(rgb1.g - rgb2.g, 2) +
-        Math.pow(rgb1.b - rgb2.b, 2)
+        Math.pow(rgb1.b - rgb2.b, 2),
     );
   }
 
   function componentToHex(c) {
     var hex = c.toString(16);
-    return hex.length == 1 ? "0" + hex : hex;
+    return hex.length === 1 ? "0" + hex : hex;
   }
 
   function rgbToHex(r, g, b) {
@@ -506,7 +590,7 @@ document.addEventListener("DOMContentLoaded", () => {
       const svgImage = new Image();
 
       const viewBoxMatch = svgText.match(
-        /viewBox="([0-9.]+) ([0-9.]+) ([0-9.]+) ([0-9.]+)"/
+        /viewBox="([0-9.]+) ([0-9.]+) ([0-9.]+) ([0-9.]+)"/,
       );
       let aspect = 1.0;
       if (viewBoxMatch && viewBoxMatch[3] && viewBoxMatch[4]) {
@@ -553,113 +637,207 @@ document.addEventListener("DOMContentLoaded", () => {
 
   function sanitizeForId(text) {
     // Replaces spaces with underscores and dots with hyphens to create a valid XML ID
-    return text.replace(/\s/g, '_').replace(/\./g, '-');
+    return text.replace(/\s/g, "_").replace(/\./g, "-");
   }
 
   function generateAndDownloadSVG() {
     console.log("Génération du SVG (mode de compatibilité maximale)...");
-    document.body.style.cursor = 'wait';
+    document.body.style.cursor = "wait";
     try {
-        const pixelSize = parseInt(pixelSizeInput.value, 10);
-        const backgroundColor = backgroundColorInput.value;
-        const finalWidth = resultCanvas.width;
-        const finalHeight = resultCanvas.height;
+      if (gridBrushIndices.length === 0) {
+        alert("Veuillez d'abord générer l'image sur le canevas.");
+        return;
+      }
 
-        const degradedData = degradedSourceCtx.getImageData(0, 0, degradedSourceCanvas.width, degradedSourceCanvas.height).data;
-        const paletteRgbColors = paletteSettings.map(p => ({ ...p, rgb: hexToRgb(p.color) }));
-        
-        if (paletteRgbColors.length === 0) {
-            alert("La palette de couleurs n'est pas configurée.");
-            return;
-        }
+      const pixelSize = parseInt(pixelSizeInput.value, 10);
+      const backgroundColor = backgroundColorInput.value;
+      const finalWidth = resultCanvas.width;
+      const finalHeight = resultCanvas.height;
 
-        let svgContent = `<svg width="${finalWidth}" height="${finalHeight}" viewBox="0 0 ${finalWidth} ${finalHeight}" xmlns="http://www.w3.org/2000/svg">`;
-        svgContent += `<rect width="100%" height="100%" fill="${backgroundColor}" />`;
+      let svgContent = `<svg width="${finalWidth}" height="${finalHeight}" viewBox="0 0 ${finalWidth} ${finalHeight}" xmlns="http://www.w3.org/2000/svg">`;
+      svgContent += `<rect width="100%" height="100%" fill="${backgroundColor}" />`;
 
-        for (let i = 0; i < degradedData.length; i += 4) {
-            const r = degradedData[i];
-            const g = degradedData[i + 1];
-            const b = degradedData[i + 2];
-            const a = degradedData[i + 3];
+      for (let i = 0; i < gridBrushIndices.length; i++) {
+        const brushIndex = gridBrushIndices[i];
+        if (brushIndex === -1) continue; // Ignorer les pixels transparents
 
-            if (a === 0) continue;
+        const settings = paletteSettings[brushIndex];
+        if (settings && SVG_DATA[settings.svgFile]) {
+          const gridX = i % degradedSourceCanvas.width;
+          const gridY = Math.floor(i / degradedSourceCanvas.width);
 
-            const avgColor = { r, g, b };
-            const pixelIndex = i / 4;
-            const gridX = pixelIndex % degradedSourceCanvas.width;
-            const gridY = Math.floor(pixelIndex / degradedSourceCanvas.width);
+          const x = gridX * pixelSize;
+          const y = gridY * pixelSize;
 
-            const x = gridX * pixelSize;
-            const y = gridY * pixelSize;
+          const size = pixelSize * settings.size;
+          const svgText = SVG_DATA[settings.svgFile];
 
-            let closestPaletteEntry = paletteRgbColors[0];
-            let minDistance = Infinity;
+          const innerSvgContentMatch = svgText.match(/<svg[^>]*>(.*)<\/svg>/s);
+          if (!innerSvgContentMatch) continue;
+          const pathContent = innerSvgContentMatch[1];
 
-            paletteRgbColors.forEach(entry => {
-                if (!entry.rgb) return;
-                const dist = colorDistance(avgColor, entry.rgb);
-                if (dist < minDistance) {
-                    minDistance = dist;
-                    closestPaletteEntry = entry;
-                }
-            });
-
-            const settings = closestPaletteEntry;
-            if (settings && SVG_DATA[settings.svgFile]) {
-                const size = pixelSize * settings.size;
-                const svgText = SVG_DATA[settings.svgFile];
-
-                const innerSvgContentMatch = svgText.match(/<svg[^>]*>(.*)<\/svg>/s);
-                if (!innerSvgContentMatch) continue;
-                const pathContent = innerSvgContentMatch[1];
-
-                const viewBoxMatch = svgText.match(/viewBox="([0-9.]+) ([0-9.]+) ([0-9.]+) ([0-9.]+)"/);
-                let aspect = 1.0;
-                let vbW = 1, vbH = 1;
-                if (viewBoxMatch && viewBoxMatch[3] && viewBoxMatch[4]) {
-                    vbW = parseFloat(viewBoxMatch[3]);
-                    vbH = parseFloat(viewBoxMatch[4]);
-                    if (vbW > 0 && vbH > 0) {
-                       aspect = vbW / vbH;
-                    }
-                }
-                
-                let targetW = size;
-                let targetH = size;
-                if (aspect > 1) {
-                    targetH = size / aspect;
-                } else {
-                    targetW = size * aspect;
-                }
-
-                const centeredX = x + (pixelSize - targetW) / 2;
-                const centeredY = y + (pixelSize - targetH) / 2;
-
-                const scaleX = vbW !== 0 ? targetW / vbW : 0;
-                const scaleY = vbH !== 0 ? targetH / vbH : 0;
-
-                // Inject the fill color directly into the path(s)
-                const pathWithFill = pathContent.replace(/<path/g, `<path fill="${settings.color}"`);
-                
-                // Wrap in a <g> tag to apply transformations
-                svgContent += `<g transform="translate(${centeredX} ${centeredY}) scale(${scaleX} ${scaleY})">${pathWithFill}</g>`;
+          const viewBoxMatch = svgText.match(
+            /viewBox="([0-9.]+) ([0-9.]+) ([0-9.]+) ([0-9.]+)"/,
+          );
+          let aspect = 1.0;
+          let vbW = 1,
+            vbH = 1;
+          if (viewBoxMatch && viewBoxMatch[3] && viewBoxMatch[4]) {
+            vbW = parseFloat(viewBoxMatch[3]);
+            vbH = parseFloat(viewBoxMatch[4]);
+            if (vbW > 0 && vbH > 0) {
+              aspect = vbW / vbH;
             }
+          }
+
+          let targetW = size;
+          let targetH = size;
+          if (aspect > 1) {
+            targetH = size / aspect;
+          } else {
+            targetW = size * aspect;
+          }
+
+          const centeredX = x + (pixelSize - targetW) / 2;
+          const centeredY = y + (pixelSize - targetH) / 2;
+
+          const scaleX = vbW !== 0 ? targetW / vbW : 0;
+          const scaleY = vbH !== 0 ? targetH / vbH : 0;
+
+          // Inject the fill color directly into the path(s)
+          const pathWithFill = pathContent.replace(
+            /<path/g,
+            `<path fill="${settings.color}"`,
+          );
+
+          // Wrap in a <g> tag to apply transformations
+          svgContent += `<g transform="translate(${centeredX} ${centeredY}) scale(${scaleX} ${scaleY})">${pathWithFill}</g>`;
         }
+      }
 
-        svgContent += '</svg>';
+      svgContent += "</svg>";
 
-        // Create blob and trigger download
-        const blob = new Blob([svgContent], { type: 'image/svg+xml' });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.download = 'tramage-image.svg';
-        link.href = url;
-        link.click();
-        URL.revokeObjectURL(url);
-        console.log("Téléchargement SVG initié.");
-
+      // Create blob and trigger download
+      const blob = new Blob([svgContent], { type: "image/svg+xml" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.download = "tramage-image.svg";
+      link.href = url;
+      link.click();
+      URL.revokeObjectURL(url);
+      console.log("Téléchargement SVG initié.");
     } finally {
-        document.body.style.cursor = 'default';
+      document.body.style.cursor = "default";
+    }
+  } // Missing closing brace for generateAndDownloadSVG()
+  function generateAndDownloadPDF() {
+    console.log("Génération du PDF...");
+    document.body.style.cursor = "wait";
+    try {
+      if (gridBrushIndices.length === 0) {
+        alert("Veuillez d'abord générer l'image sur le canevas.");
+        return;
+      }
+
+      const pixelSize = parseInt(pixelSizeInput.value, 10);
+      const backgroundColor = backgroundColorInput.value;
+      const finalWidth = resultCanvas.width;
+      const finalHeight = resultCanvas.height;
+
+      let svgContentString = `<svg width="${finalWidth}" height="${finalHeight}" viewBox="0 0 ${finalWidth} ${finalHeight}" xmlns="http://www.w3.org/2000/svg">`;
+      svgContentString += `<rect width="100%" height="100%" fill="${backgroundColor}" />`;
+
+      for (let i = 0; i < gridBrushIndices.length; i++) {
+        const brushIndex = gridBrushIndices[i];
+        if (brushIndex === -1) continue;
+
+        const settings = paletteSettings[brushIndex];
+        if (settings && SVG_DATA[settings.svgFile]) {
+          const gridX = i % degradedSourceCanvas.width;
+          const gridY = Math.floor(i / degradedSourceCanvas.width);
+
+          const x = gridX * pixelSize;
+          const y = gridY * pixelSize;
+
+          const size = pixelSize * settings.size;
+          const svgText = SVG_DATA[settings.svgFile];
+
+          const innerSvgContentMatch = svgText.match(/<svg[^>]*>(.*)<\/svg>/s);
+          if (!innerSvgContentMatch) continue;
+          const pathContent = innerSvgContentMatch[1];
+
+          const viewBoxMatch = svgText.match(
+            /viewBox="([0-9.]+)\s([0-9.]+)\s([0-9.]+)\s([0-9.]+)"/,
+          );
+          let aspect = 1.0;
+          let vbW = 1,
+            vbH = 1;
+          if (viewBoxMatch && viewBoxMatch[3] && viewBoxMatch[4]) {
+            vbW = parseFloat(viewBoxMatch[3]);
+            vbH = parseFloat(viewBoxMatch[4]);
+            if (vbW > 0 && vbH > 0) {
+              aspect = vbW / vbH;
+            }
+          }
+
+          let targetW = size;
+          let targetH = size;
+          if (aspect > 1) {
+            targetH = size / aspect;
+          } else {
+            targetW = size * aspect;
+          }
+
+          const centeredX = x + (pixelSize - targetW) / 2;
+          const centeredY = y + (pixelSize - targetH) / 2;
+
+          const scaleX = vbW !== 0 ? targetW / vbW : 0;
+          const scaleY = vbH !== 0 ? targetH / vbH : 0;
+
+          const pathWithFill = pathContent.replace(
+            /<path/g,
+            `<path fill="${settings.color}"`,
+          );
+
+          svgContentString += `<g transform="translate(${centeredX} ${centeredY}) scale(${scaleX} ${scaleY})">${pathWithFill}</g>`;
+        }
+      }
+      svgContentString += "</svg>";
+
+      // Initialize jsPDF
+      const { jsPDF } = window.jspdf;
+      const orientation = finalWidth > finalHeight ? "l" : "p";
+      const doc = new jsPDF(orientation, "pt", [finalWidth, finalHeight]);
+
+      const tempCanvas = document.createElement("canvas");
+      tempCanvas.width = finalWidth;
+      tempCanvas.height = finalHeight;
+      const tempCtx = tempCanvas.getContext("2d");
+
+      const svgImage = new Image();
+      const svgBlob = new Blob([svgContentString], {
+        type: "image/svg+xml;charset=utf-8",
+      });
+      const url = URL.createObjectURL(svgBlob);
+
+      svgImage.onload = () => {
+        tempCtx.drawImage(svgImage, 0, 0, finalWidth, finalHeight);
+        const imgData = tempCanvas.toDataURL("image/png");
+        URL.revokeObjectURL(url);
+
+        doc.addImage(imgData, "PNG", 0, 0, finalWidth, finalHeight);
+        doc.save("tramage-image.pdf");
+        console.log("Téléchargement PDF initié.");
+      };
+
+      svgImage.onerror = (err) => {
+        console.error("Erreur de chargement de l'image SVG pour le PDF.", err);
+        URL.revokeObjectURL(url);
+      };
+
+      svgImage.src = url;
+    } finally {
+      document.body.style.cursor = "default";
     }
   }
 });
